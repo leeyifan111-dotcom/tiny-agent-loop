@@ -12,6 +12,27 @@ client = OpenAI(
 def get_weather(city: str) -> str:
     return f"{city} 今天 25°C，晴"   # 先写死，练习用
 
+def get_weather_batch(cities: list[str]) -> str:
+    """批量查询多个城市的天气
+
+    支持一次传入多个城市；某个城市查询失败不影响其他城市。
+    返回结构化结果，便于 LLM 后续推理。
+    """
+    if not cities:
+        return "错误：未提供任何城市"
+
+    results = []
+    for city in cities:
+        try:
+            results.append(f"{city} 今天 25°C，晴")
+        except Exception as e:
+            # 单城市失败不抛出，标记错误后继续
+            results.append(f"{city}：查询失败（{e}）")
+
+    return "\n".join(results)
+
+
+
 def calculator(expression: str) -> str:
     return str(eval(expression))      # 练习用，生产环境禁止 eval
 
@@ -22,7 +43,7 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "calculator",
+            "name": "get_weather",
             "description": "查询城市天气",
             "parameters": {
                 "type": "object",
@@ -34,7 +55,19 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "get_weather",
+            "name": "get_weather_batch",
+            "description": "批量查询城市天气",
+            "parameters": {
+                "type": "object",
+                "properties": {"cities": {"type": "array", "description": "城市名"}},
+                "required": ["cities"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
             "description": "计算一个数学表达式",
             "parameters": {
                 "type": "object",
@@ -53,6 +86,9 @@ def execute_tool(name, args: dict) -> str:
         return get_weather(**args)
     if name == "calculator":
         return calculator(**args)
+
+    if name == "get_weather_batch":
+        return get_weather_batch(**args)
     return f"未知工具: {name}"
 
 # ---------- Agent Loop：核心循环 ----------
@@ -82,4 +118,4 @@ def run_agent(user_input, max_turns=10):
             })
 
 if __name__ == "__main__":
-    run_agent("北京天气怎么样，然后算一下 25 加 18")
+    run_agent("分别调用北京和上海的天气怎么样，然后算一下 25 加 18")
