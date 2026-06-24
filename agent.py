@@ -31,7 +31,8 @@ def get_weather_batch(cities: list[str]) -> str:
 
     return "\n".join(results)
 
-
+def get_city_play(city: str) -> str:
+    return f"{city} 推荐去上海滩玩"
 
 def calculator(expression: str) -> str:
     return str(eval(expression))      # 练习用，生产环境禁止 eval
@@ -76,24 +77,112 @@ tools = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_city_play",
+            "description": "get_city_play",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "array", "description": "城市名"}},
+                "required": ["expression"],
+            },
+        },
+    },
 ]
 
 
 
 
 def execute_tool(name, args: dict) -> str:
-    if name == "get_weather":
-        return get_weather(**args)
-    if name == "calculator":
-        return calculator(**args)
+    TOOL_REGISTRY = {
+        "get_weather": get_weather,
+        "calculator": calculator,
+        "get_weather_batch": get_weather_batch,
+    }
+    result = TOOL_REGISTRY[name](**args) if name in TOOL_REGISTRY else f"未知工具: {name}"
+    return result
 
-    if name == "get_weather_batch":
-        return get_weather_batch(**args)
-    return f"未知工具: {name}"
+
+class RecoverableError(Exception): pass     # 网络抖动、超时 → 重试
+class FatalError(Exception): pass            # 权限错误、工具异常 → 立即停
+
+def safe_dispatch(name, args, max_retry=2):
+    TOOL_REGISTRY = {
+        "get_weather": get_weather,
+        "calculator": calculator,
+        "get_weather_batch": get_weather_batch,
+        "get_city_play": get_city_play
+    }
+    for attempt in range(max_retry + 1):
+        try:
+            return TOOL_REGISTRY[name](**args)
+        except RecoverableError as e:
+            if attempt == max_retry:
+                return f"error 工具 {name} 重试 {max_retry} 次仍失败: {e}"
+            continue
+        except FatalError as e:
+            print(f"⚠️ 工具 {name} 不可恢复错误: {e}")
+            choice = input("y = 我已人工修复，请重试；n = 终止任务: ").strip().lower()
+            if choice == "y":
+                return TOOL_REGISTRY[name](**args)
+            return "用户已终止任务"
+        except Exception as e:
+            return f"error 工具 {name} 未知错误: {e}"
+
+
+# 在某些工具失败后，让 LLM 显式表态是 retry 还是 stop
+def llm_reflect(error_msg: str) -> dict:
+    resp = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "工具失败了，请反思后输出决策"},
+            {"role": "user", "content": f"错误: {error_msg}\n输出 JSON: {{\"reflection\": \"...\", \"decision\": \"retry\" | \"stop\"}}"},
+        ],
+        response_format={"type": "json_object"},
+    )
+    return json.loads(resp.choices[0].message.content)
+
 
 # ---------- Agent Loop：核心循环 ----------
 def run_agent(user_input, max_turns=10):
-    messages = [{"role": "user", "content": user_input}]
+    SYSTEM_PROMPT = """你是一个数据查询助手，在一个 Agent 循环里工作。
+
+    # 工具使用规则
+    - 回答相关信息（天气/股价/新闻等等）必须调用对应工具，禁止用内置知识回答
+
+    # 内置知识禁令（替换原"实时信息"那条）
+    - 任何具体的实体名称（地名/产品/机构/人物/数字/日期/推荐列表）若非来自工具返回，禁止出现在回答中
+    - 禁止用"常识"、"通常"、"一般来说"、"建议"、"举例"、"属于...知识"等任何说法绕过此规则
+    - 模型不允许自行判断"这个问题不需要工具"——只要回答涉及具体实体，要么走工具，要么 CANNOT_COMPLETE
+
+    # 自我正当化检测
+    - 如果你正在写"这个问题属于..."、"我可以直接..."、"虽然没工具但..." 这类自辩句子，立刻停止并输出 CANNOT_COMPLETE
+
+
+    # 思维流程（每步必须先 thought 再 action）
+    - thought：我下一步要做什么？为什么？
+    - action：调哪个工具，参数是什么？或者：FINAL_ANSWER
+    - 调工具前：必须先在普通回复内容里输出一句 "Thought: 我要调 XX 工具，因为 YY"，然后再发起 tool_call
+    - 不调工具时：开头加 "Final Thought: ..." 再给最终答案
+    - 禁止 content 为空就调工具——必须先说为什么
+
+
+    # 不确定性处理
+    - 不知道就说"我不知道"，禁止编造
+    - 任何形式的实体名称（地名/产品名/数字/日期）若非来自工具返回，禁止出现在回答中
+
+    # 终止信号
+    - 完成：输出 `FINAL_ANSWER: <答案>`
+    - 失败：输出 `CANNOT_COMPLETE: <原因>`
+
+    # 关键约束（再说一遍，防止 Lost in the Middle）
+    - 工具失败必须停手
+    - 不知道必须说
+    - 高危操作必须问用户
+    """
+    messages = [ {"role": "system", "content": SYSTEM_PROMPT},{"role": "user", "content": user_input}]
+    turn_signatures = []
     for turn in range(max_turns):                      # 终止条件1：最大轮数
         resp = client.chat.completions.create(
             model="deepseek-chat", messages=messages, tools=tools,
@@ -105,17 +194,42 @@ def run_agent(user_input, max_turns=10):
             print(f"\n✅  最终回答: {msg.content}")
             return msg.content
 
-        for call in msg.tool_calls:                    # LLM 要调工具：逐个执行
+        if msg.content:
+            print(f"thought: {msg.content}\n")
+
+        # ↓↓↓ 新增：把这一轮所有 tool calls 打包成一个签名 ↓↓↓
+        sig = " | ".join(sorted(
+            f"{call.function.name}({call.function.arguments})"
+            for call in msg.tool_calls
+        ))
+
+        print(f"sig: {sig}")
+
+        # ↓↓↓ 新增：跨轮判等检测 ↓↓↓
+        if sig in turn_signatures:
+            print(f"⚠️ Turn {turn} 的决策跟之前某轮完全一样，循环检测触发")
+            return "循环检测：模型在反复做相同决策，已强制终止"
+
+        turn_signatures.append(sig)
+
+        for call in msg.tool_calls:
+            # LLM 要调工具：逐个执行
             name = call.function.name
             args = json.loads(call.function.arguments) # 字符串→字典
             print(f"  🔧 调用 {name}({args})")
-            result = execute_tool(name, args)
+            result = safe_dispatch(name, args)
             print(f"  ↩️  结果: {result}")
+            if "error" in result :
+                reflection = llm_reflect(result)
+                result=result+",反思:"+reflection['reflection']+",建议:"+reflection['decision']
+                print(reflection)
+                if reflection['decision'] == "stop": return "任务终止：stop"
             messages.append({                          # 结果回填给 LLM
                 "role": "tool",
                 "tool_call_id": call.id,
                 "content": result,
             })
 
+
 if __name__ == "__main__":
-    run_agent("分别调用北京和上海的天气怎么样，然后算一下 25 加 18")
+    run_agent("分别调用北京和上海的天气怎么样，然后算一下 25 加 18，最后告诉我上海有什么好玩的？")
