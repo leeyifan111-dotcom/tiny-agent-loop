@@ -23,6 +23,29 @@ def get_weather_batch(cities: list[str]) -> str:
 
     results = []
     for city in cities:
+        if city == "火星":
+            raise FatalError(f"工具不支持查询 {city}（行政区不存在）")
+        try:
+            results.append(f"{city} 今天 25°C，晴")
+        except Exception as e:
+            # 单城市失败不抛出，标记错误后继续
+            results.append(f"{city}：查询失败（{e}）")
+
+    return "\n".join(results)
+
+def get_weather_huoxing(addresses: list[str]) -> str:
+    """批量查询多个城市的天气
+
+    支持一次传入多个城市；某个城市查询失败不影响其他城市。
+    返回结构化结果，便于 LLM 后续推理。
+    """
+    if not addresses:
+        return "错误：未提供任何城市"
+
+    results = []
+    for city in addresses:
+        if city == "火星":
+            raise FatalError(f"工具不支持查询 {city}（行政区不存在）")
         try:
             results.append(f"{city} 今天 25°C，晴")
         except Exception as e:
@@ -45,10 +68,10 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_weather",
-            "description": "查询城市天气",
+            "description": "查询天气",
             "parameters": {
                 "type": "object",
-                "properties": {"city": {"type": "string", "description": "城市名"}},
+                "properties": {"city": {"type": "string", "description": "地址"}},
                 "required": ["city"],
             },
         },
@@ -57,11 +80,23 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_weather_batch",
-            "description": "批量查询城市天气",
+            "description": "批量查询天气",
             "parameters": {
                 "type": "object",
-                "properties": {"cities": {"type": "array", "description": "城市名"}},
+                "properties": {"cities": {"type": "array", "description": "地址"}},
                 "required": ["cities"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather_huoxing",
+            "description": "批量查询火星天气",
+            "parameters": {
+                "type": "object",
+                "properties": {"addresses": {"type": "array", "description": "火星地址"}},
+                "required": ["addresses"],
             },
         },
     },
@@ -99,6 +134,7 @@ def execute_tool(name, args: dict) -> str:
         "get_weather": get_weather,
         "calculator": calculator,
         "get_weather_batch": get_weather_batch,
+        "get_weather_huoxing": get_weather_huoxing,
     }
     result = TOOL_REGISTRY[name](**args) if name in TOOL_REGISTRY else f"未知工具: {name}"
     return result
@@ -107,12 +143,13 @@ def execute_tool(name, args: dict) -> str:
 class RecoverableError(Exception): pass     # 网络抖动、超时 → 重试
 class FatalError(Exception): pass            # 权限错误、工具异常 → 立即停
 
-def safe_dispatch(name, args, max_retry=2):
+def safe_dispatch(name, args, max_retry=3):
     TOOL_REGISTRY = {
         "get_weather": get_weather,
         "calculator": calculator,
         "get_weather_batch": get_weather_batch,
-        "get_city_play": get_city_play
+        "get_city_play": get_city_play,
+        "get_weather_huoxing": get_weather_huoxing,
     }
     for attempt in range(max_retry + 1):
         try:
@@ -125,8 +162,11 @@ def safe_dispatch(name, args, max_retry=2):
             print(f"⚠️ 工具 {name} 不可恢复错误: {e}")
             choice = input("y = 我已人工修复，请重试；n = 终止任务: ").strip().lower()
             if choice == "y":
-                return TOOL_REGISTRY[name](**args)
-            return "用户已终止任务"
+                try:
+                    return TOOL_REGISTRY[name](**args)
+                except Exception as retry_err:
+                    return f"error 工具 {name} 人工修复后仍失败: {retry_err}"
+            return f"error 工具 {name} 用户已终止"
         except Exception as e:
             return f"error 工具 {name} 未知错误: {e}"
 
@@ -232,4 +272,4 @@ def run_agent(user_input, max_turns=10):
 
 
 if __name__ == "__main__":
-    run_agent("分别调用北京和上海的天气怎么样，然后算一下 25 加 18，最后告诉我上海有什么好玩的？")
+    run_agent("北京和火星的天气怎么样？")
